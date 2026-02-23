@@ -11,7 +11,7 @@ import wandb
 config = {
     "n_embd": 16,
     "n_head": 4,
-    "block_size": 32, # Increased slightly to allow for longer generation context
+    "block_size": 16,
     "n_layer": 2,
     "learning_rate": 0.01,
     "num_steps": 100000,
@@ -28,25 +28,21 @@ run = wandb.init(project="playground-gpt", name=f"run_{datetime.datetime.now().s
 
 random.seed(42)
 
-# --- Data Loading (Tiny Shakespeare) ---
+# --- Data Loading ---
 if not os.path.exists('input.txt'):
     import urllib.request
-    print("Downloading tiny shakespeare dataset...")
-    url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    urllib.request.urlretrieve(url, 'input.txt')
+    print("Downloading input.txt...")
+    names_url = 'https://raw.githubusercontent.com/karpathy/makemore/refs/heads/master/names.txt'
+    urllib.request.urlretrieve(names_url, 'input.txt')
 
-# Read the entire file as one continuous string
-text = open('input.txt', 'r').read()
-print(f"Dataset length in characters: {len(text)}")
+docs = [l.strip() for l in open('input.txt').read().strip().split('\n') if l.strip()]
+random.shuffle(docs)
+print(f"num docs: {len(docs)}")
 
-# Create vocabulary based on all unique characters in the text
-uchars = sorted(set(text))
-vocab_size = len(uchars)
+uchars = sorted(set(''.join(docs)))
+BOS = len(uchars)
+vocab_size = len(uchars) + 1
 print(f"vocab size: {vocab_size}")
-
-# Lookup tables for encoding and decoding
-stoi = {ch: i for i, ch in enumerate(uchars)}
-itos = {i: ch for i, ch in enumerate(uchars)}
 
 # --- Model Definition ---
 class Value:
@@ -67,11 +63,6 @@ class Value:
     def __add__(self, other):
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data + other.data, (self, other), (1, 1))
-
-
-
-
-        
     def __mul__(self, other):
         other = other if isinstance(other, Value) else Value(other)
         return Value(self.data * other.data, (self, other), (other.data, self.data))
@@ -186,26 +177,21 @@ v = [0.0] * len(params)
 num_steps = config['num_steps']
 start_time = time.time()
 max_duration = config['max_runtime_hours'] * 3600
-best_loss = float('inf')
 
 print("Starting training loop...")
 
 for step in range(num_steps):
+    # Check for timeout
     if time.time() - start_time > max_duration:
         print(f"Reached maximum runtime of {config['max_runtime_hours']} hours. Stopping.")
         break
 
-    # Randomly sample a continuous chunk from the Shakespeare text
-    ix = random.randint(0, len(text) - block_size - 1)
-    chunk = text[ix : ix + block_size + 1]
-    tokens = [stoi[ch] for ch in chunk]
-    
-    # We always use the full block_size for continuous text
-    n = block_size 
+    doc = docs[step % len(docs)]
+    tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
+    n = min(block_size, len(tokens) - 1)
 
     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
     losses = []
-    
     for pos_id in range(n):
         token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
         logits = gpt(token_id, pos_id, keys, values)
@@ -226,65 +212,28 @@ for step in range(num_steps):
         p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
         p.grad = 0
 
+    # Log to WandB
     wandb.log({"loss": loss.data, "step": step, "lr": lr_t})
 
-    if loss.data < best_loss:
-        best_loss = loss.data
-        # Save model locally whenever we find a new best loss
-        raw_state_dict = {}
-        for k, v_layer in state_dict.items():
-            raw_state_dict[k] = [[val.data for val in row] for row in v_layer]
-        with open("best_model.json", "w") as f:
-            json.dump(raw_state_dict, f)
-
-    if step % 10 == 0:
-        print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f} | best_loss {best_loss:.4f}")
+    if step % 100 == 0:
+        print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}")
 
 print("Training completed.")
 
 # --- Save Model ---
-print("Logging best model weights to wandb...")
-# The best_model.json was saved incrementally during the loop, upload that one!
+print("Saving model weights to model.json...")
+# Convert state_dict (Value objects) to list of floats
+raw_state_dict = {}
+for k, v in state_dict.items():
+    # v is a list of lists of Values
+    raw_state_dict[k] = [[val.data for val in row] for row in v]
 
-try:
-    artifact = wandb.Artifact("kaggleformer-weights", type="model")
-    artifact.add_file("best_model.json")
-    run.log_artifact(artifact)
-except FileNotFoundError:
-    print("No best_model.json found to log (perhaps training exited immediately).")
+with open("model.json", "w") as f:
+    json.dump(raw_state_dict, f)
+
+# Log to WandB as Artifact
+artifact = wandb.Artifact("kaggleformer-weights", type="model")
+artifact.add_file("model.json")
+run.log_artifact(artifact)
 
 wandb.finish()
-
-# --- Generation ---
-print("\n--- Generating Shakespeare ---")
-context_str = "ROMEO:"
-generated = context_str
-print(generated, end="", flush=True)
-
-# Re-initialize empty K/V caches for generation
-keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-
-# 1. Feed the prompt into the model to populate the Key/Value cache
-logits = None
-for i, ch in enumerate(context_str):
-    token_id = stoi[ch]
-    logits = gpt(token_id, i, keys, values)
-
-# 2. Autoregressively generate new characters
-# Note: We cap generation to the remaining `block_size` because our position embeddings (wpe) only go up to `block_size`
-chars_to_generate = block_size - len(context_str)
-
-for i in range(len(context_str), len(context_str) + chars_to_generate):
-    probs = softmax(logits)
-    
-    # Simple argmax sampling (taking the most likely next character)
-    next_token_id = max(range(vocab_size), key=lambda idx: probs[idx].data)
-    next_char = itos[next_token_id]
-    
-    generated += next_char
-    print(next_char, end="", flush=True)
-    
-    # Feed the newly generated character back into the model to predict the next one
-    logits = gpt(next_token_id, i, keys, values)
-
-print("\n")

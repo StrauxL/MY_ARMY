@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 sample_data/
 images/
+models/
+.env
