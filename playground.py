@@ -1,290 +1,614 @@
-import os
-from kaggle_secrets import UserSecretsClient
-import math
-import random
-import time
-import datetime
-import json
-import wandb
+############################# FINAL ##########################
 
-# --- Configuration ---
-config = {
-    "n_embd": 16,
-    "n_head": 4,
-    "block_size": 32, # Increased slightly to allow for longer generation context
-    "n_layer": 2,
-    "learning_rate": 0.01,
-    "num_steps": 100000,
-    "batch_size": 1,
-    "max_runtime_hours": 12,
-}
+# import os
+# import sys
+# import math
+# import random
+# import time
+# import datetime
+# import json
+# import numpy as np
 
-# Initialize WandB
-user_secrets = UserSecretsClient()
-wandb_api = user_secrets.get_secret("WANDB_API_KEY")
-wandb.login(key=wandb_api)
+# # NEW IMPORTS FOR PYTORCH
+# import torch
+# import torch.nn as nn
+# from torch.nn import functional as F
+# import wandb
 
-run = wandb.init(project="playground-gpt", name=f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}", config=config)
+# try:
+#     from kaggle_secrets import UserSecretsClient
+# except ImportError:
+#     class UserSecretsClient:
+#         def get_secret(self, key):
+#             return ""
 
-random.seed(42)
+# # --- Configuration (NanoGPT defaults) ---
+# config = {
+#     "n_embd": 384,      
+#     "n_head": 6,        
+#     "block_size": 256,  
+#     "n_layer": 6,       
+#     "learning_rate": 1e-3, 
+#     "num_steps": 100_000,      # Karpathy's NanoGPT default
+#     "batch_size": 32,       # Reduced from 64 to prevent CUDA OOM on Kaggle T4
+#     "max_runtime_hours": 12,
+# }
 
-# --- Data Loading (Tiny Shakespeare) ---
-if not os.path.exists('input.txt'):
-    import urllib.request
-    print("Downloading tiny shakespeare dataset...")
-    url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    urllib.request.urlretrieve(url, 'input.txt')
+# # Ensure we use GPU / NPU if available!
+# # If your Asus Zephyrus G14 NPU driver maps to DirectML or a custom torch backend, it will be mapped here automatically.
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# if __name__ == '__main__':
+#     print(f"\n[Hardware Target] Initializing model on: {device.upper()}\n")
 
-# Read the entire file as one continuous string
-text = open('input.txt', 'r').read()
-print(f"Dataset length in characters: {len(text)}")
+# # Initialize WandB
+# user_secrets = UserSecretsClient()
+# wandb_api = user_secrets.get_secret("WANDB_API_KEY")
 
-# Create vocabulary based on all unique characters in the text
-uchars = sorted(set(text))
-vocab_size = len(uchars)
-print(f"vocab size: {vocab_size}")
+# run = None
+# if wandb_api:
+#     wandb.login(key=wandb_api)
+#     run = wandb.init(project="playground-gpt", name=f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}", config=config)
 
-# Lookup tables for encoding and decoding
-stoi = {ch: i for i, ch in enumerate(uchars)}
-itos = {i: ch for i, ch in enumerate(uchars)}
+# random.seed(42)
+# torch.manual_seed(42)
 
-# --- Model Definition ---
-class Value:
-    __slots__ = ('data', 'grad', '_children', '_local_grads')
+# # --- Data Loading (Chess PGN) ---
+# import glob
+# script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+# local_data_file = os.path.join(script_dir, 'sample_data', 'lichess.pgn.zst')
+# data_file = local_data_file
 
-    def __init__(self, data, children=(), local_grads=()):
-        self.data = data
-        self.grad = 0
-        self._children = children
-        self._local_grads = local_grads
-
-    def __repr__(self):
-        return f"Value(data={self.data:.4f})"
-
-    def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
-    def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
-    def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
-    def __add__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data + other.data, (self, other), (1, 1))
-
-
-
-
+# if not os.path.exists(data_file):
+#     # Fallbacks for Kaggle or current directory
+#     kaggle_search = glob.glob('/kaggle/input/**/*.zst', recursive=True)
+#     local_search = glob.glob('*.zst')
+    
+#     if kaggle_search:
+#         data_file = kaggle_search[0]
+#         print(f"Found Kaggle dataset: {data_file}")
+#     elif os.path.exists('/kaggle/working/lichess.pgn.zst'):
+#         data_file = '/kaggle/working/lichess.pgn.zst'
+#     elif local_search:
+#         data_file = local_search[0]
+#         print(f"Found local dataset: {data_file}")
+#     else:
+#         print("Dataset not found. Downloading Lichess standard rated games (Jan 2013)...")
+#         # Ensure we have requests
+#         try:
+#             import requests
+#         except ImportError:
+#             print("Installing requests library...")
+#             import subprocess
+#             subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+#             import requests
+            
+#         url = "https://database.lichess.org/standard/lichess_db_standard_rated_2013-01.pgn.zst"
         
-    def __mul__(self, other):
-        other = other if isinstance(other, Value) else Value(other)
-        return Value(self.data * other.data, (self, other), (other.data, self.data))
-    def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
-    def __neg__(self): return self * -1
-    def __radd__(self, other): return self + other
-    def __sub__(self, other): return self + (-other)
-    def __rsub__(self, other): return other + (-self)
-    def __rmul__(self, other): return self * other
-    def __truediv__(self, other): return self * other**-1
-    def __rtruediv__(self, other): return other * self**-1
+#         # Determine download path based on environment
+#         if os.path.exists('/kaggle/working/'):
+#             dl_path = '/kaggle/working/lichess.pgn.zst'
+#         else:
+#             dl_path = local_data_file
+#             os.makedirs(os.path.dirname(dl_path), exist_ok=True)
+            
+#         try:
+#             # Stream download to avoid RAM OOM
+#             with requests.get(url, stream=True) as r:
+#                 r.raise_for_status()
+#                 with open(dl_path, 'wb') as f:
+#                     for chunk in r.iter_content(chunk_size=8192):
+#                         f.write(chunk)
+#             print(f"Download complete: {dl_path}")
+#             data_file = dl_path
+#         except Exception as e:
+#             print(f"Failed to download from Lichess: {e}")
+#             print("Falling back to Hugging Face dataset (adamkarvonen/chess_games)...")
+#             try:
+#                 import datasets
+#             except ImportError:
+#                 print("Installing datasets library...")
+#                 import subprocess
+#                 subprocess.check_call([sys.executable, "-m", "pip", "install", "datasets"])
+#                 import datasets
+                
+#             ds = datasets.load_dataset("adamkarvonen/chess_games", split="train", streaming=True)
+#             text_chunks = []
+#             total_chars = 0
+#             for item in ds:
+#                 # Use the first value of the row, which contains the PGN text
+#                 game = list(item.values())[0] 
+#                 if game.strip():
+#                     text_chunks.append(game)
+#                     total_chars += len(game)
+#                 if total_chars > 50 * 1024 * 1024:
+#                     break
+                    
+#             text = "\n".join(text_chunks)
+#             data_file = None # Indicates text is already loaded into memory
 
-    def backward(self):
-        topo = []
-        visited = set()
-        def build_topo(v):
-            if v not in visited:
-                visited.add(v)
-                for child in v._children:
-                    build_topo(child)
-                topo.append(v)
-        build_topo(self)
+# if data_file is not None:
+#     import zstandard as zstd
+#     import io
+#     print("Decompressing and cleaning PGN data (first 500MB for Kaggle Limits)...")
+#     with open(data_file, 'rb') as f:
+#         dctx = zstd.ZstdDecompressor()
+#         # Read a chunk instead of the whole file to avoid OOM on huge DBs
+#         with dctx.stream_reader(f) as reader:
+#             text = reader.read(500 * 1024 * 1024).decode('utf-8', errors='ignore')
+# else:
+#     print("PGN data already loaded into memory via Hugging Face fallback.")
 
-        self.grad = 1
-        for v in reversed(topo):
-            for child, local_grad in zip(v._children, v._local_grads):
-                child.grad += local_grad * v.grad
 
-n_embd = config['n_embd']
-n_head = config['n_head']
-head_dim = n_embd // n_head
-block_size = config['block_size']
-n_layer = config['n_layer']
 
-matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 
-for i in range(n_layer):
-    state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
 
-params = [p for mat in state_dict.values() for row in mat for p in row]
-print(f"num params: {len(params)}")
+import re
+import io
+# try:
+#     import chess
+#     import chess.pgn
+# except ImportError:
+#     print("Installing python-chess library...")
+#     import subprocess
+#     subprocess.check_call([sys.executable, "-m", "pip", "install", "python-chess"])
+#     import chess
+#     import chess.pgn
 
-# --- Utils ---
-def linear(x, w):
-    return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
+# print("Parsing games for Multimodal Dataset...")
+# pgn_io = io.StringIO(text)
+# games = []
+# total_chars_in_vocab = ""
 
-def rmsnorm(x):
-    ms = sum(xi * xi for xi in x) / len(x)
-    scale = (ms + 1e-5) ** -0.5
-    return [xi * scale for xi in x]
+# max_games = 50_000 # Safe limit for Kaggle RAM
+# while len(games) < max_games:
+#     try:
+#         game = chess.pgn.read_game(pgn_io)
+#         if game is None:
+#             break
+            
+#         exporter = chess.pgn.StringExporter(headers=False, variations=False, comments=False)
+#         game_str = game.accept(exporter)
+#         game_str = re.sub(r'\s+', ' ', game_str).strip()
+        
+#         if len(game_str) > 20: 
+#             games.append((game, game_str))
+#             total_chars_in_vocab += game_str + " "
+#     except Exception as e:
+#         continue
 
-def softmax(logits):
-    max_val = max(val.data for val in logits)
-    exps = [(val - max_val).exp() for val in logits]
-    total = sum(exps)
-    return [e / total for e in exps]
 
-def gpt(token_id, pos_id, keys, values):
-    tok_emb = state_dict['wte'][token_id]
-    pos_emb = state_dict['wpe'][pos_id]
-    x = [t + p for t, p in zip(tok_emb, pos_emb)]
-    x = rmsnorm(x)
+# # Custom BPE tokenizer for Chess PGN
+# try:
+#     from tokenizers import Tokenizer
+#     from tokenizers.models import BPE
+#     from tokenizers.trainers import BpeTrainer
+#     from tokenizers.pre_tokenizers import Whitespace
+# except ImportError:
+#     print("Installing tokenizers library...")
+#     import subprocess
+#     subprocess.check_call([sys.executable, "-m", "pip", "install", "tokenizers"])
+#     from tokenizers import Tokenizer
+#     from tokenizers.models import BPE
+#     from tokenizers.trainers import BpeTrainer
+#     from tokenizers.pre_tokenizers import Whitespace
 
-    for li in range(n_layer):
-        x_residual = x
-        x = rmsnorm(x)
+# # Initialize a tokenizer
+# tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+# tokenizer.pre_tokenizer = Whitespace()
 
-        q = linear(x, state_dict[f'layer{li}.attn_wq'])
-        k = linear(x, state_dict[f'layer{li}.attn_wk'])
-        v = linear(x, state_dict[f'layer{li}.attn_wv'])
-        keys[li].append(k)
-        values[li].append(v)
+# # Train the tokenizer on the games text in memory
+# print("Training BPE Tokenizer on PGN data...")
+# trainer = BpeTrainer(special_tokens=["[UNK]", "[PAD]"], vocab_size=5000)
 
-        x_attn = []
-        for h in range(n_head):
-            hs = h * head_dim
-            q_h = q[hs:hs+head_dim]
-            k_h = [ki[hs:hs+head_dim] for ki in keys[li]]
-            v_h = [vi[hs:hs+head_dim] for vi in values[li]]
+# # We can provide an iterator to train from memory, avoiding the need to write to disk
+# def get_training_corpus():
+#     for game_obj, game_str in games:
+#         yield game_str
 
-            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
-            attn_weights = softmax(attn_logits)
+# tokenizer.train_from_iterator(get_training_corpus(), trainer=trainer)
+# tokenizer.save("tokenizer.json")
+# print("BPE Tokenizer trained and saved to tokenizer.json")
 
-            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
-            x_attn.extend(head_out)
 
-        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
-        x = [a + b for a, b in zip(x, x_residual)]
+# vocab_size = tokenizer.get_vocab_size()
 
-        x_residual = x
-        x = rmsnorm(x)
+# def encode(s):
+#     # .ids gives back the list of integers
+#     return tokenizer.encode(s).ids 
 
-        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
-        x = [xi.relu() for xi in x]
-        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
-        x = [a + b for a, b in zip(x, x_residual)]
+# def decode(l):
+#     return tokenizer.decode(l)
 
-    logits = linear(x, state_dict['lm_head'])
-    return logits
-
-# --- Training Loop --- 
-learning_rate, beta1, beta2, eps_adam = config['learning_rate'], 0.85, 0.99, 1e-8
-m = [0.0] * len(params)
-v = [0.0] * len(params)
-
-num_steps = config['num_steps']
-start_time = time.time()
-max_duration = config['max_runtime_hours'] * 3600
-best_loss = float('inf')
-
-print("Starting training loop...")
-
-for step in range(num_steps):
-    if time.time() - start_time > max_duration:
-        print(f"Reached maximum runtime of {config['max_runtime_hours']} hours. Stopping.")
-        break
-
-    # Randomly sample a continuous chunk from the Shakespeare text
-    ix = random.randint(0, len(text) - block_size - 1)
-    chunk = text[ix : ix + block_size + 1]
-    tokens = [stoi[ch] for ch in chunk]
+# if __name__ == '__main__':
+#     print(f"Parsed {len(games)} games into memory.")
+#     print(f"Vocab size: {vocab_size}")
     
-    # We always use the full block_size for continuous text
-    n = block_size 
+#     meta = {'vocab_size': vocab_size}
+#     with open('meta.json', 'w') as f:
+#         json.dump(meta, f)
 
-    keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-    losses = []
+# n_games = len(games)
+# train_games = games[:int(n_games*0.9)]
+# val_games = games[int(n_games*0.9):]
+
+# def board_to_tensor(board):
+#     """
+#     =============================================================================
+#     EDUCATIONAL EXPLANATION: THE VISION TENSOR (8x8x14)
+#     =============================================================================
+#     Why not a 2D array (8x8) of numbers from 1 to 6?
+#     Because neural networks treat larger numbers mathematically. A King (6) would
+#     generate a much larger gradient signal than a Pawn (1), which is false! 
     
-    for pos_id in range(n):
-        token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-        logits = gpt(token_id, pos_id, keys, values)
-        probs = softmax(logits)
-        loss_t = -probs[target_id].log()
-        losses.append(loss_t)
-
-    loss = (1/n)*sum(losses)
-    loss.backward()
-
-    lr_t = learning_rate * (1 - step / num_steps)
-
-    for i, p in enumerate(params):
-        m[i] = beta1 * m[i] + (1 - beta1) * p.grad
-        v[i] = beta2 * v[i] + (1 - beta2) * p.grad ** 2
-        m_hat = m[i] / (1 - beta1 ** (step + 1))
-        v_hat = v[i] / (1 - beta2 ** (step + 1))
-        p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
-        p.grad = 0
-
-    wandb.log({"loss": loss.data, "step": step, "lr": lr_t})
-
-    if loss.data < best_loss:
-        best_loss = loss.data
-        # Save model locally whenever we find a new best loss
-        raw_state_dict = {}
-        for k, v_layer in state_dict.items():
-            raw_state_dict[k] = [[val.data for val in row] for row in v_layer]
-        with open("best_model.json", "w") as f:
-            json.dump(raw_state_dict, f)
-
-    if step % 10 == 0:
-        print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f} | best_loss {best_loss:.4f}")
-
-print("Training completed.")
-
-# --- Save Model ---
-print("Logging best model weights to wandb...")
-# The best_model.json was saved incrementally during the loop, upload that one!
-
-try:
-    artifact = wandb.Artifact("kaggleformer-weights", type="model")
-    artifact.add_file("best_model.json")
-    run.log_artifact(artifact)
-except FileNotFoundError:
-    print("No best_model.json found to log (perhaps training exited immediately).")
-
-wandb.finish()
-
-# --- Generation ---
-print("\n--- Generating Shakespeare ---")
-context_str = "ROMEO:"
-generated = context_str
-print(generated, end="", flush=True)
-
-# Re-initialize empty K/V caches for generation
-keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-
-# 1. Feed the prompt into the model to populate the Key/Value cache
-logits = None
-for i, ch in enumerate(context_str):
-    token_id = stoi[ch]
-    logits = gpt(token_id, i, keys, values)
-
-# 2. Autoregressively generate new characters
-# Note: We cap generation to the remaining `block_size` because our position embeddings (wpe) only go up to `block_size`
-chars_to_generate = block_size - len(context_str)
-
-for i in range(len(context_str), len(context_str) + chars_to_generate):
-    probs = softmax(logits)
+#     Instead, we use 14 "Channels" (Boolean masks) representing spatial geometry:
+#     - Channels 0-5  : White Pieces (Pawn, Knight, Bishop, Rook, Queen, King)
+#     - Channels 6-11 : Black Pieces
+#     - Channel  12   : Turn to move (All 1s for White, All 0s for Black)
+#     - Channel  13   : Castling rights (4 specific corners act as flags for Q/K side)
     
-    # Simple argmax sampling (taking the most likely next character)
-    next_token_id = max(range(vocab_size), key=lambda idx: probs[idx].data)
-    next_char = itos[next_token_id]
-    
-    generated += next_char
-    print(next_char, end="", flush=True)
-    
-    # Feed the newly generated character back into the model to predict the next one
-    logits = gpt(next_token_id, i, keys, values)
+#     This provides massive *Inductive Bias*. Instead of the Language Model memorizing 
+#     which squares are adjacent, the math of the tensor visually proves it!
+#     =============================================================================
+#     """
+#     # Returns (14, 8, 8) Boolean layer feature channels for vision
+#     tensor = torch.zeros(14, 8, 8, dtype=torch.float32)
+#     for square in chess.SQUARES:
+#         piece = board.piece_at(square)
+#         if piece is not None:
+#             channel = (piece.piece_type - 1)
+#             if not piece.color: channel += 6
+#             rank, file = chess.square_rank(square), chess.square_file(square)
+#             tensor[channel, rank, file] = 1.0
+#     if board.turn == chess.WHITE: tensor[12, :, :] = 1.0
+#     if board.has_kingside_castling_rights(chess.WHITE): tensor[13, 0, 7] = 1.0
+#     if board.has_queenside_castling_rights(chess.WHITE): tensor[13, 0, 0] = 1.0
+#     if board.has_kingside_castling_rights(chess.BLACK): tensor[13, 7, 7] = 1.0
+#     if board.has_queenside_castling_rights(chess.BLACK): tensor[13, 7, 0] = 1.0
+#     return tensor
 
-print("\n")
+
+
+
+# =============================================================================
+# PYTORCH MODEL IMPLEMENTATION
+# =============================================================================
+
+
+# class RMSNorm(nn.Module):
+#     def __init__(self, dim, eps=1e-5):
+#         super().__init__()
+#         self.eps = eps
+#         # nn.Parameter tells PyTorch to track gradients for these weights!
+#         self.weight = nn.Parameter(torch.ones(dim))
+
+#     def forward(self, x):
+#         # PyTorch calculates the exact same math, but automates the chained derivative!
+#         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+# class Block(nn.Module):
+#     def __init__(self, n_embd, n_head):
+#         super().__init__()
+#         self.n_head = n_head
+#         self.head_dim = n_embd // n_head
+        
+#         self.ln_1 = RMSNorm(n_embd)
+#         self.attn_wq = nn.Linear(n_embd, n_embd, bias=False)
+#         self.attn_wk = nn.Linear(n_embd, n_embd, bias=False)
+#         self.attn_wv = nn.Linear(n_embd, n_embd, bias=False)
+#         self.attn_wo = nn.Linear(n_embd, n_embd, bias=False)
+        
+#         self.ln_2 = RMSNorm(n_embd)
+#         self.mlp_fc1 = nn.Linear(n_embd, 4 * n_embd, bias=False)
+#         self.mlp_fc2 = nn.Linear(4 * n_embd, n_embd, bias=False)
+
+#     def forward(self, x):
+#         B, T, C = x.shape
+        
+#         # 1. Attention
+#         x_norm = self.ln_1(x)
+#         q = self.attn_wq(x_norm).view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hd)
+#         k = self.attn_wk(x_norm).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+#         v = self.attn_wv(x_norm).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+#         # PyTorch has a highly optimized native function for scaled dot product attention!
+#         # It handles the causal masking automatically, and computes it exponentially faster than standard matrix multiplication.
+#         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+#         attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, C)
+#         x = x + self.attn_wo(attn_out)
+        
+#         # 2. MLP
+#         x_norm2 = self.ln_2(x)
+#         x = x + self.mlp_fc2(F.relu(self.mlp_fc1(x_norm2)))
+#         return x
+
+# class VisionTower(nn.Module):
+#     """
+#     =============================================================================
+#     EDUCATIONAL EXPLANATION: MULTIMODAL FUSION
+#     =============================================================================
+#     How does a Sequence Model (NanoGPT) use a Vision Model (CNN)?
+    
+#     1. The Conv2d blocks scan the 8x8x14 board state, detecting tactical patterns
+#        like pins, forks, and pawn chains using sliding spatial filters.
+#     2. We squash all this visual understanding down into a single massive vector
+#        of size `n_embd` (384) using a Fully Connected (Linear) layer.
+#     3. In `GPT.forward`, we will place this `vis_emb` token at the very front 
+#        of our text sequence (like a [CLS] prepended prompt!). 
+       
+#     The Transformer's Self-Attention heads now dynamically compute the relationship 
+#     between:
+#        (A) The absolute spatial truth of the board (Vision)
+#        (B) The sequential history of the past moves (Language)
+#     =============================================================================
+#     """
+#     def __init__(self, n_embd):
+#         super().__init__()
+#         # 8x8x14 Board State Spatial Extractor
+#         self.conv1 = nn.Conv2d(14, 64, kernel_size=3, padding=1)
+#         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+#         self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+#         self.fc = nn.Linear(256 * 8 * 8, n_embd)
+        
+#     def forward(self, x):
+#         B = x.size(0)
+#         x = F.relu(self.conv1(x))
+#         x = F.relu(self.conv2(x))
+#         x = F.relu(self.conv3(x))
+#         x = x.view(B, -1)
+#         x = self.fc(x)
+#         return x.unsqueeze(1) # Acts as a prompt [CLS] prefix token (B, 1, n_embd)
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size, n_embd, block_size, n_layer, n_head):
+        super().__init__()
+        self.wte = nn.Embedding(vocab_size, n_embd)
+        self.wpe = nn.Embedding(block_size, n_embd)
+        self.vision_tower = VisionTower(n_embd)
+        
+        self.blocks = nn.ModuleList([Block(n_embd, n_head) for _ in range(n_layer)])
+        self.ln_f = RMSNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        
+    def forward(self, idx, targets=None, vision_boards=None):
+        B, T = idx.shape
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        
+        tok_emb = self.wte(idx) # (B, T, C)
+        pos_emb = self.wpe(pos) # (T, C)
+        text_emb = tok_emb + pos_emb
+        
+        if vision_boards is not None:
+            vis_emb = self.vision_tower(vision_boards) # (B, 1, C)
+            # Prepend the vision spatial context map directly to text tokens!
+            x = torch.cat([vis_emb, text_emb], dim=1) # (B, 1+T, C)
+        else:
+            x = text_emb
+        
+        for block in self.blocks:
+            x = block(x)
+            
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        
+        # Discard the vision token logit (we don't predict a next vision token directly here)
+        if vision_boards is not None:
+            logits = logits[:, 1:, :] # Returns back to (B, T, Vocab)
+            
+        if targets is None:
+            loss = None
+        else:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.view(-1))
+            
+        return logits, loss
+
+def get_batch(split):
+    """
+    =============================================================================
+    EDUCATIONAL EXPLANATION: RANDOM MOVE VS MOST PROBABLE
+    =============================================================================
+    Why do we pick a `random move` during training instead of the most probable?
+    
+    In Deep Learning (specifically Supervised Fine-Tuning / Autoregressive training), 
+    we need to teach the model how to play in ALL situations: openings, mid-games, 
+    and end-games. If we always picked the "most probable" or just starting moves, 
+    the model would never learn what to do when there are 5 pieces left on the board!
+
+    So, we look at actual Grandmaster games. We randomly pick an exact moment in that 
+    game (the `random move`), rebuild the board up to that moment, feed it to the model, 
+    and tell it: "Given this board and this history, predict what the Grandmaster 
+    actually played next!"
+    
+    This calculates the Loss (error). The model learns to make its "most probable" 
+    predictions slowly align with the Grandmaster's real moves over time!
+    =============================================================================
+    """
+    data = train_games if split == 'train' else val_games
+    batch_x, batch_y, batch_v = [], [], []
+    
+    for _ in range(config['batch_size']):
+        game_obj, _ = random.choice(data)
+        moves_list = list(game_obj.mainline())
+        if not moves_list:
+            continue
+            
+        # We pick a random position in the game to train the model on predicting
+        # the EXACT next move that was made in real life!
+        move_idx = random.randint(0, len(moves_list) - 1)
+        
+        board = chess.Board()
+        history_str = ""
+        for i in range(move_idx):
+            if board.turn == chess.WHITE:
+                history_str += f"{board.fullmove_number}. "
+            history_str += f"{board.san(moves_list[i].move)} "
+            board.push(moves_list[i].move)
+            
+        if board.turn == chess.WHITE:
+            history_str += f"{board.fullmove_number}. "
+            
+        target_str = f"{board.san(moves_list[move_idx].move)} "
+        x_str = history_str + target_str
+        
+        # 1) Vision Context: The literal 8x8 spatial grid snapshot right before the move
+        batch_v.append(board_to_tensor(board))
+        
+        # 2) Text Context: The sequence of tokens
+        seq = encode(x_str)
+        hist_len = len(encode(history_str))
+        
+        full_x = seq[:-1]
+        
+        # Target labels mapping!
+        # -100 is PyTorch's magic number to IGNORE calculating loss on these tokens.
+        # We only want to train the model to predict `target_str`, NOT `history_str`,
+        # because the vision tensor is a snapshot of the board AFTER the history is over.
+        full_labels = [-100] * len(full_x)
+        for i in range(hist_len - 1, len(full_labels)):
+            full_labels[i] = seq[i + 1]
+            
+        # Truncate to block_size if the sequence is too long
+        if len(full_x) > config['block_size']:
+            x = full_x[-config['block_size']:]
+            y = full_labels[-config['block_size']:]
+        else:
+            # Pad with 0s for input, and -100s for ignored labels if too short
+            pad_len = config['block_size'] - len(full_x)
+            x = full_x + [0] * pad_len
+            y = full_labels + [-100] * pad_len
+            
+        batch_x.append(torch.tensor(x, dtype=torch.long))
+        batch_y.append(torch.tensor(y, dtype=torch.long))
+        
+    X = torch.stack(batch_x).to(device)
+    Y = torch.stack(batch_y).to(device)
+    V = torch.stack(batch_v).to(device)
+    return X, Y, V
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(20) # eval 20 batches
+        for k in range(20):
+            X, Y, V = get_batch(split)
+            logits, loss = model(X, Y, vision_boards=V)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+model = GPT(vocab_size, config['n_embd'], config['block_size'], config['n_layer'], config['n_head'])
+model.to(device)
+if __name__ == '__main__':
+    print(f"num params: {sum(p.numel() for p in model.parameters())}")
+
+if __name__ == '__main__':
+    # --- Training Loop --- 
+    # PyTorch natively provides standard optimizers (Adam, AdamW, SGD)
+    # This directly replaces our manual velocity/momentum (m_hat / v_hat) tracking code!
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=0.1)
+
+    num_steps = config['num_steps']
+    start_time = time.time()
+    max_duration = config['max_runtime_hours'] * 3600
+    best_loss = float('inf')
+    
+    print(f"Starting training loop on {device}...")
+    
+    for step in range(num_steps):
+        if time.time() - start_time > max_duration:
+            print(f"Reached maximum runtime of {config['max_runtime_hours']} hours. Stopping.")
+            break
+            
+        # Every 100 steps, evaluate the loss on train and val sets
+        if step % 100 == 0:
+            losses = estimate_loss()
+            print(f"step {step:4d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
+            
+            if losses['val'] < best_loss:
+                best_loss = losses['val']
+                print(f"Saving best model (val_loss {best_loss:.4f})...")
+                torch.save(model.state_dict(), "best_model.pt")
+                
+            if run:
+                wandb.log({"train_loss": losses['train'], "val_loss": losses['val'], "step": step})
+    
+        X, Y, V = get_batch('train')
+    
+        # Forward pass
+        logits, loss = model(X, Y, vision_boards=V)
+        
+        # Backward pass
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+    
+        # Gradient Clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
+        # Optimizer step
+        optimizer.step()
+
+
+    print("Training completed.")
+    
+    # --- Save Model ---
+    if run:
+        print("Logging best model weights to wandb...")
+        try:
+            artifact = wandb.Artifact("kaggleformer-weights", type="model")
+            artifact.add_file("best_model.pt")
+            if os.path.exists("meta.json"):
+                artifact.add_file("meta.json")
+            if os.path.exists("tokenizer.json"):
+                artifact.add_file("tokenizer.json")
+            run.log_artifact(artifact)
+            wandb.finish()
+        except FileNotFoundError:
+            print("No best_model.pt found to log.")
+        
+    
+    # Ensure generation uses the best model weights rather than the last step's weights
+    if os.path.exists("best_model.pt"):
+        model.load_state_dict(torch.load("best_model.pt", weights_only=True))
+        print("Loaded best_model.pt for generation.")
+
+    # --- Generation ---
+    print("\n--- Generating Chess Moves ---")
+    model.eval() # Set model to inference mode (affects dropout/batchnorm if used)
+    context_str = "1. "
+    print(context_str, end="", flush=True)
+
+    block_size = config['block_size']
+    tokens_to_generate = 500
+    
+    board = chess.Board() # The active generator board
+    
+    # Pre-encode context
+    idx = torch.tensor(encode(context_str), dtype=torch.long, device=device).unsqueeze(0) # (1, T)
+    
+    for _ in range(tokens_to_generate):
+        # Crop context to strictly within memory limit
+        idx_cond = idx[:, -block_size:]
+        
+        # Inject the current visual reality of the board
+        V_cond = board_to_tensor(board).unsqueeze(0).to(device)
+        
+        with torch.no_grad(): # Disable autograd during generation for massive speedup!
+            logits, _ = model(idx_cond, vision_boards=V_cond)
+            
+        # Get only the last token's distributions
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        
+        # Sample using PyTorch's native function
+        idx_next = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+        
+        # Decode specifically the single new token and print it
+        next_text = decode([idx_next.item()])
+        print(next_text, end="", flush=True)
+    
+    print("\n")
